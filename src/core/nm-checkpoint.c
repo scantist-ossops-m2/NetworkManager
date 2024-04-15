@@ -17,6 +17,7 @@
 #include "nm-manager.h"
 #include "settings/nm-settings.h"
 #include "settings/nm-settings-connection.h"
+#include "settings/plugins/keyfile/nms-keyfile-storage.h"
 #include "nm-simple-connection.h"
 #include "nm-utils.h"
 
@@ -34,6 +35,8 @@ typedef struct {
     bool               is_software : 1;
     bool               realized : 1;
     bool               activation_lifetime_bound_to_profile_visibility : 1;
+    bool               settings_connection_is_unsaved : 1;
+    bool               settings_connection_is_shadowed : 1;
     NMUnmanFlagOp      unmanaged_explicit;
     NMActivationReason activation_reason;
     gulong             dev_exported_change_id;
@@ -161,6 +164,9 @@ find_settings_connection(NMCheckpoint     *self,
     NMSettingsConnection *sett_conn;
     const char           *uuid, *ac_uuid;
     const CList          *tmp_clist;
+    gboolean              sett_conn_unsaved;
+    gboolean              sett_conn_shadowed;
+    NMSettingsStorage    *storage;
 
     *need_activation = FALSE;
     *need_update     = FALSE;
@@ -171,7 +177,7 @@ find_settings_connection(NMCheckpoint     *self,
     if (!sett_conn)
         return NULL;
 
-    /* Now check if the connection changed, ... */
+    /* Check if the connection changed */
     if (!nm_connection_compare(dev_checkpoint->settings_connection,
                                nm_settings_connection_get_connection(sett_conn),
                                NM_SETTING_COMPARE_FLAG_EXACT)) {
@@ -180,7 +186,25 @@ find_settings_connection(NMCheckpoint     *self,
         *need_activation = TRUE;
     }
 
-    /* ... is active, ... */
+    /* Check if the connection storage changed */
+    storage            = nm_settings_connection_get_storage(sett_conn);
+    sett_conn_unsaved  = NM_FLAGS_HAS(nm_settings_connection_get_flags(sett_conn),
+                                     NM_SETTINGS_CONNECTION_INT_FLAGS_UNSAVED);
+    sett_conn_shadowed = storage && nm_settings_storage_get_shadowed_storage(storage, NULL);
+
+    if (sett_conn_unsaved != dev_checkpoint->settings_connection_is_unsaved
+        || sett_conn_shadowed != dev_checkpoint->settings_connection_is_shadowed) {
+        _LOGT("rollback: storage changed for settings connection %s: unsaved (%d -> %d), shadowed "
+              "(%d -> %d)",
+              uuid,
+              dev_checkpoint->settings_connection_is_unsaved,
+              sett_conn_unsaved,
+              dev_checkpoint->settings_connection_is_shadowed,
+              sett_conn_shadowed);
+        *need_update = TRUE;
+    }
+
+    /* Check if the active state changed */
     nm_manager_for_each_active_connection (priv->manager, active, tmp_clist) {
         ac_uuid =
             nm_settings_connection_get_uuid(nm_active_connection_get_settings_connection(active));
@@ -196,7 +220,7 @@ find_settings_connection(NMCheckpoint     *self,
         return sett_conn;
     }
 
-    /* ... or if the connection was reactivated/reapplied */
+    /* Check if the connection was reactivated/reapplied */
     if (nm_active_connection_version_id_get(active) != dev_checkpoint->ac_version_id) {
         _LOGT("rollback: active connection version id of %s changed", uuid);
         *need_activation = TRUE;
@@ -228,10 +252,31 @@ restore_and_activate_connection(NMCheckpoint *self, DeviceCheckpoint *dev_checkp
     sett_flags = NM_SETTINGS_CONNECTION_INT_FLAGS_NONE;
     sett_mask  = NM_SETTINGS_CONNECTION_INT_FLAGS_NONE;
 
+    /* With regard to storage, there are 4 different possible states for the settings
+     * connection: 1) persistent; 2) in-memory only; 3) in-memory shadowing a persistent
+     * file; 4) in-memory shadowing a detached persistent file (i.e. the deletion of
+     * the connection doesn't delete the persistent file).
+     * It would be difficult to implement the full rollback of the exact state for the
+     * last two cases because that would require to store information about the shadowed
+     * storage, restore the file and the nmmeta section in /run.
+     * Therefore, if we need to roll back a in-memory-with-shadowed-file connection,
+     * promote it to a full persistent connection.
+     */
+    if (dev_checkpoint->settings_connection_is_unsaved
+        && !dev_checkpoint->settings_connection_is_shadowed) {
+        persist_mode = NM_SETTINGS_CONNECTION_PERSIST_MODE_IN_MEMORY_ONLY;
+    } else {
+        if (dev_checkpoint->settings_connection_is_unsaved) {
+            _LOGW("rollback: device \"%s\" had an in-memory connection with persistent "
+                  "storage. After rollback, the connection will become persistent",
+                  dev_checkpoint->original_dev_name);
+        }
+        persist_mode = NM_SETTINGS_CONNECTION_PERSIST_MODE_TO_DISK;
+    }
+
     if (connection) {
         if (need_update) {
             _LOGD("rollback: updating connection %s", nm_settings_connection_get_uuid(connection));
-            persist_mode = NM_SETTINGS_CONNECTION_PERSIST_MODE_KEEP;
             nm_settings_connection_update(
                 connection,
                 NULL,
@@ -249,7 +294,6 @@ restore_and_activate_connection(NMCheckpoint *self, DeviceCheckpoint *dev_checkp
         _LOGD("rollback: adding connection %s again",
               nm_connection_get_uuid(dev_checkpoint->settings_connection));
 
-        persist_mode = NM_SETTINGS_CONNECTION_PERSIST_MODE_TO_DISK;
         if (!nm_settings_add_connection(NM_SETTINGS_GET,
                                         NULL,
                                         dev_checkpoint->settings_connection,
@@ -589,6 +633,8 @@ device_checkpoint_create(NMCheckpoint *checkpoint, NMDevice *device)
 
     act_request = nm_device_get_act_request(device);
     if (act_request) {
+        NMSettingsStorage *storage;
+
         settings_connection = nm_act_request_get_settings_connection(act_request);
         applied_connection  = nm_act_request_get_applied_connection(act_request);
 
@@ -602,6 +648,13 @@ device_checkpoint_create(NMCheckpoint *checkpoint, NMDevice *device)
         dev_checkpoint->activation_lifetime_bound_to_profile_visibility =
             NM_FLAGS_HAS(nm_active_connection_get_state_flags(NM_ACTIVE_CONNECTION(act_request)),
                          NM_ACTIVATION_STATE_FLAG_LIFETIME_BOUND_TO_PROFILE_VISIBILITY);
+
+        storage = nm_settings_connection_get_storage(settings_connection);
+        dev_checkpoint->settings_connection_is_unsaved =
+            NM_FLAGS_HAS(nm_settings_connection_get_flags(settings_connection),
+                         NM_SETTINGS_CONNECTION_INT_FLAGS_UNSAVED);
+        dev_checkpoint->settings_connection_is_shadowed =
+            storage && nm_settings_storage_get_shadowed_storage(storage, NULL);
     }
 
     return dev_checkpoint;
